@@ -334,6 +334,9 @@ const PINK =   { r: 0xfa, g: 0x24, b: 0x73 };
 const ORANGE = { r: 0xfe, g: 0x95, b: 0x22 };
 const allColors = [BLUE, GREEN, PINK, ORANGE];
 
+// Bomb color (near-black)
+const BOMB_BLACK = { r: 0x16, g: 0x16, b: 0x18 };
+
 // Gameplay
 const getSpawnDelay = () => {
 	const spawnDelayMax = 1400;
@@ -346,6 +349,7 @@ const doubleStrongEnableScore = 2000;
 const slowmoThreshold = 10;
 const strongThreshold = 25;
 const spinnerThreshold = 25;
+const bombThreshold = 8;
 
 // Interaction state
 let pointerIsDown = false;
@@ -365,6 +369,7 @@ const airDrag = 0.022;
 const gravity = 0.3;
 // Spark config
 const sparkColor = 'rgba(170,221,255,.9)';
+const fireSparkColor = 'rgba(255,140,20,.95)';
 const sparkThickness = 2.2;
 const airDragSpark = 0.1;
 // Track pointer positions to show trail
@@ -888,6 +893,44 @@ function makeCubeModel({ scale=1 }) {
 	};
 }
 
+// A low-poly UV sphere, made of quads (with pinched poles).
+// Used for the bomb entity — gives a rounded, "circle-like" 3D silhouette.
+function makeSphereModel({ radius=1, latBands=8, lonBands=12 }) {
+	const vertices = [];
+
+	for (let lat=0; lat<=latBands; lat++) {
+		const theta = (lat / latBands) * PI;
+		const sinTheta = Math.sin(theta);
+		const cosTheta = Math.cos(theta);
+		for (let lon=0; lon<lonBands; lon++) {
+			const phi = (lon / lonBands) * TAU;
+			vertices.push({
+				x: -radius * sinTheta * Math.cos(phi),
+				y: radius * cosTheta,
+				z: radius * sinTheta * Math.sin(phi)
+			});
+		}
+	}
+
+	const vIndex = (lat, lon) => lat * lonBands + (lon % lonBands);
+
+	const polys = [];
+	for (let lat=0; lat<latBands; lat++) {
+		for (let lon=0; lon<lonBands; lon++) {
+			polys.push({
+				vIndexes: [
+					vIndex(lat, lon),
+					vIndex(lat, lon + 1),
+					vIndex(lat + 1, lon + 1),
+					vIndex(lat + 1, lon)
+				]
+			});
+		}
+	}
+
+	return { vertices, polys };
+}
+
 // Not very optimized - lots of duplicate vertices are generated.
 function makeRecursiveCubeModel({ recursionLevel, splitFn, color, scale=1 }) {
 	const getScaleAtLevel = level => 1 / (3 ** level);
@@ -1183,6 +1226,32 @@ const targets = [];
 const targetPool = new Map(allColors.map(c=>([c, []])));
 const targetWireframePool = new Map(allColors.map(c=>([c, []])));
 
+// Bombs use a distinct (sphere) model/shape, so they get their own pool.
+const bombPool = [];
+
+function getBombEntity() {
+	let bomb = bombPool.pop();
+	if (!bomb) {
+		bomb = new Entity({
+			model: makeSphereModel({ radius: targetRadius, latBands: 8, lonBands: 12 }),
+			color: BOMB_BLACK,
+			wireframe: false
+		});
+		bomb.color = BOMB_BLACK;
+		bomb.wireframe = false;
+	}
+	bomb.isBomb = true;
+	bomb.hit = false;
+	bomb.maxHealth = 1;
+	bomb.health = 1;
+	return bomb;
+}
+
+function returnBomb(bomb) {
+	bomb.reset();
+	bombPool.push(bomb);
+}
+
 
 
 const getTarget = (() => {
@@ -1203,6 +1272,12 @@ const getTarget = (() => {
 	const spinnerSpawner = makeSpawner({
 		chance: 0.1,
 		cooldownPerSpawn: 10000,
+		maxSpawns: 1
+	});
+
+	const bombSpawner = makeSpawner({
+		chance: 0.65,
+		cooldownPerSpawn: 8000,
 		maxSpawns: 1
 	});
 
@@ -1247,6 +1322,35 @@ const getTarget = (() => {
 		} else if (!doubleStrong && state.game.score > doubleStrongEnableScore) {
 			doubleStrong = true;
 			strongSpawner.mutate({ maxSpawns: 2 });
+		}
+
+		// Bomb Spawning
+		// --------------------------------
+		if (state.game.cubeCount >= bombThreshold && bombSpawner.shouldSpawn()) {
+			const bomb = getBombEntity();
+
+			// Same spin physics as the normal blocks: pick 2 of the 3 axes and
+			// give each a random spin speed.
+			const bombSpinSpeeds = [
+				Math.random() * 0.1 - 0.05,
+				Math.random() * 0.1 - 0.05
+			];
+			const bombAxes = pickOne(axisOptions);
+			bombSpinSpeeds.forEach((spinSpeed, i) => {
+				switch (bombAxes[i]) {
+					case 'x':
+						bomb.rotateXD = spinSpeed;
+						break;
+					case 'y':
+						bomb.rotateYD = spinSpeed;
+						break;
+					case 'z':
+						bomb.rotateZD = spinSpeed;
+						break;
+				}
+			});
+
+			return bomb;
 		}
 
 		// Target Parameters
@@ -1326,6 +1430,10 @@ const updateTargetHealth = (target, healthDelta) => {
 
 
 const returnTarget = target => {
+	if (target.isBomb) {
+		returnBomb(target);
+		return;
+	}
 	target.reset();
 	const pool = target.wireframe ? targetWireframePool : targetPool;
 	pool.get(target.color).push(target);
@@ -1353,6 +1461,8 @@ const frags = [];
 // // Also pool wireframe instances separately.
 const fragPool = new Map(allColors.map(c=>([c, []])));
 const fragWireframePool = new Map(allColors.map(c=>([c, []])));
+// Bombs explode into their own (black) fragment pool.
+const bombFragPool = [];
 
 
 const createBurst = (() => {
@@ -1369,6 +1479,19 @@ const createBurst = (() => {
 	const fragCount = basePositions.length;
 
 	function getFragForTarget(target) {
+		if (target.isBomb) {
+			let frag = bombFragPool.pop();
+			if (!frag) {
+				frag = new Entity({
+					model: makeCubeModel({ scale: fragRadius }),
+					color: BOMB_BLACK,
+					wireframe: false
+				});
+				frag.color = BOMB_BLACK;
+				frag.wireframe = false;
+			}
+			return frag;
+		}
 		const pool = target.wireframe ? fragWireframePool : fragPool;
 		let frag = pool.get(target.color).pop();
 		if (!frag) {
@@ -1447,6 +1570,8 @@ const createBurst = (() => {
 			frag.rotateYD = frag.yD * rotateScale;
 			frag.rotateZD = frag.zD * rotateScale;
 
+			frag.isBomb = !!target.isBomb;
+
 			frags.push(frag);
 		};
 	}
@@ -1455,6 +1580,10 @@ const createBurst = (() => {
 
 const returnFrag = frag => {
 	frag.reset();
+	if (frag.isBomb) {
+		bombFragPool.push(frag);
+		return;
+	}
 	const pool = frag.wireframe ? fragWireframePool : fragPool;
 	pool.get(frag.color).push(frag);
 };
@@ -1471,7 +1600,7 @@ const sparks = [];
 const sparkPool = [];
 
 
-function addSpark(x, y, xD, yD) {
+function addSpark(x, y, xD, yD, color=sparkColor) {
 	const spark = sparkPool.pop() || {};
 
 	spark.x = x + xD * 0.5;
@@ -1480,6 +1609,7 @@ function addSpark(x, y, xD, yD) {
 	spark.yD = yD;
 	spark.life = random(200, 300);
 	spark.maxLife = spark.life;
+	spark.color = color;
 
 	sparks.push(spark);
 
@@ -1488,7 +1618,7 @@ function addSpark(x, y, xD, yD) {
 
 
 // Spherical spark burst
-function sparkBurst(x, y, count, maxSpeed) {
+function sparkBurst(x, y, count, maxSpeed, color=sparkColor) {
 	const angleInc = TAU / count;
 	for (let i=0; i<count; i++) {
 		const angle = i * angleInc + angleInc * Math.random();
@@ -1497,7 +1627,8 @@ function sparkBurst(x, y, count, maxSpeed) {
 			x,
 			y,
 			Math.sin(angle) * speed,
-			Math.cos(angle) * speed
+			Math.cos(angle) * speed,
+			color
 		);
 	}
 }
@@ -1524,6 +1655,22 @@ function glueShedSparks(target) {
 			);
 		}
 	});
+}
+
+// Continuous little "fuse" sparks that sputter off the top of a bomb while
+// it falls, like a lit fuse — gives the bomb its fiery, ticking look.
+function bombFuseSpark(target) {
+	if (Math.random() < 0.55) {
+		const fx = target.projected.x + random(-6, 6);
+		const fy = target.projected.y - targetRadius * 0.85 + random(-4, 4);
+		addSpark(
+			fx,
+			fy,
+			random(-7, 7),
+			random(-16, -6),
+			fireSparkColor
+		);
+	}
 }
 
 function returnSpark(spark) {
@@ -1955,11 +2102,19 @@ function tick(width, height, simTime, simSpeed, lag) {
 		target.transform();
 		target.project();
 
+		// Bombs sputter continuous little fire sparks off their fuse while they fall.
+		if (target.isBomb) {
+			bombFuseSpark(target);
+		}
+
 		// Remove if offscreen
 		if (target.y > centerY + targetHitRadius * 2) {
 			targets.splice(i, 1);
 			returnTarget(target);
-			if (isInGame()) {
+			if (target.isBomb) {
+				// Letting a bomb fall off the bottom is exactly what you want to
+				// do with it — no penalty for leaving it alone.
+			} else if (isInGame()) {
 				if (isCasualGame()) {
 					incrementScore(-25);
 				} else {
@@ -2002,16 +2157,31 @@ function tick(width, height, simTime, simSpeed, lag) {
 						incrementScore(10);
 
 						if (target.health <= 0) {
-							incrementCubeCount(1);
 							createBurst(target, forceMultiplier);
 							sparkBurst(hitX, hitY, 8, sparkSpeed);
-							if (target.wireframe) {
-								slowmoRemaining = slowmoDuration;
-								spawnTime = 0;
-								spawnExtra = 2;
+
+							if (target.isBomb) {
+								// Cutting a bomb is BAD: big fiery explosion, then
+								// it's game over (or a harsh score hit in casual mode).
+								sparkBurst(hitX, hitY, 28, sparkSpeed * 2.2, fireSparkColor);
+								sparkBurst(hitX, hitY, 14, sparkSpeed * 1.3);
+								targets.splice(i, 1);
+								returnTarget(target);
+								if (isCasualGame()) {
+									incrementScore(-100);
+								} else {
+									endGame();
+								}
+							} else {
+								incrementCubeCount(1);
+								if (target.wireframe) {
+									slowmoRemaining = slowmoDuration;
+									spawnTime = 0;
+									spawnExtra = 2;
+								}
+								targets.splice(i, 1);
+								returnTarget(target);
 							}
-							targets.splice(i, 1);
-							returnTarget(target);
 						} else {
 							sparkBurst(hitX, hitY, 8, sparkSpeed);
 							glueShedSparks(target);
@@ -2273,22 +2443,15 @@ function draw(ctx, width, height, viewScale) {
 
 	// 2D Sparks
 	// ---------------
-	ctx.strokeStyle = sparkColor;
 	ctx.lineWidth = sparkThickness;
-	ctx.beginPath();
 	sparks.forEach(spark => {
-		ctx.moveTo(spark.x, spark.y);
-		// Shrink sparks to zero length as they die.
-		// Speed up shrinking as life approaches 0 (root curve).
-		// Note that sparks already get smaller over time as their speed slows
-		// down from damping. So this is like a double scale down. To counter this
-		// a bit and keep the sparks larger for longer, we'll also increase the scale
-		// a bit after applying the root curve.
+		ctx.strokeStyle = spark.color || sparkColor;
 		const scale = (spark.life / spark.maxLife) ** 0.5 * 1.5;
+		ctx.beginPath();
+		ctx.moveTo(spark.x, spark.y);
 		ctx.lineTo(spark.x - spark.xD*scale, spark.y - spark.yD*scale);
-
+		ctx.stroke();
 	});
-	ctx.stroke();
 
 
 	// Touch Strokes
